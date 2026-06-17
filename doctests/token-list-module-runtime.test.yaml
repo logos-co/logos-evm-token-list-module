@@ -1,0 +1,148 @@
+name: "Running the token-list Module Against logoscore"
+output: token-list-module-runtime.md
+release: ""
+
+intro: |
+  `logos-evm-token-list-module` downloads, parses, and merges
+  [Uniswap token-lists](https://github.com/Uniswap/token-lists) plus a user
+  "custom" list for the Logos multi-chain EVM wallet, deduped per chain. Downloads
+  go through the same fail-closed proxy chokepoint as the eth-rpc module.
+
+  This doc-test drives the module through a `logoscore` daemon against a **local
+  static file server** (offline, reproducible): it configures a list URL,
+  refreshes, reads the merged tokens, adds a custom token, and finally shows the
+  fail-closed refusal when a proxy is required but unavailable.
+
+what_you_build: "This `token_list_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local list server."
+
+what_you_learn:
+  - How list URLs are configured and fetched into the module
+  - How downloaded lists merge with a user custom list (deduped per chain)
+  - How the fail-closed proxy chokepoint refuses a fetch when a proxy is required but unavailable
+
+prerequisites:
+  - |
+    **Nix** with flakes enabled (see [nixos.org](https://nixos.org/download.html)).
+  - "**A Linux or macOS machine** with `python3` available (used to serve the local token list)."
+
+sections:
+  - title: "Build logoscore and lgpm"
+    step: true
+    steps:
+      - title: "Build logoscore"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
+        check_file: "logos/bin/logoscore"
+      - title: "Build lgpm"
+        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
+        check_file: "lgpm/bin/lgpm"
+
+  - title: "Build and install the token-list module"
+    step: true
+    steps:
+      - title: "Build the module's .lgx"
+        run: "nix build 'github:logos-co/logos-evm-token-list-module#lgx' --no-write-lock-file -o token-list-lgx"
+        code_block: |
+          nix build 'github:logos-co/logos-evm-token-list-module#lgx' -o token-list-lgx
+      - title: "Seed the capability module"
+        run: |
+          mkdir -p modules
+          cp -RL ./logos/modules/. ./modules/
+        check_file: "modules/capability_module/manifest.json"
+      - title: "Install the .lgx with lgpm"
+        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file token-list-lgx/*.lgx"
+        expect_contains:
+          - "Installed to:"
+
+  - title: "Serve a token list locally"
+    step: true
+    steps:
+      - title: "Write a Uniswap-schema token list"
+        file:
+          path: list.json
+          content: |
+            {
+              "name": "Test List",
+              "tokens": [
+                { "chainId": 1, "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "name": "USD Coin", "symbol": "USDC", "decimals": 6 },
+                { "chainId": 1, "address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "name": "Tether", "symbol": "USDT", "decimals": 6 },
+                { "chainId": 10, "address": "0x4200000000000000000000000000000000000042", "name": "Optimism", "symbol": "OP", "decimals": 18 }
+              ]
+            }
+      - title: "Start a static file server"
+        run: "sh -c 'python3 -m http.server 8601 > httpd.log 2>&1 &'"
+        code_block: "python3 -m http.server 8601 &"
+      - run: "sleep 2"
+
+  - title: "Run the daemon and drive the module"
+    step: true
+    steps:
+      - title: "Write the configs"
+        file:
+          path: tl_config.json
+          content: |
+            { "listUrls": ["http://127.0.0.1:8601/list.json"], "proxyRequired": false }
+      - title: "Write the fail-closed config"
+        file:
+          path: tl_config_fc.json
+          content: |
+            { "listUrls": ["http://127.0.0.1:8601/list.json"], "proxyRequired": true }
+      - title: "Write a custom token"
+        file:
+          path: custom_token.json
+          content: |
+            { "chainId": 1, "address": "0x1111111111111111111111111111111111111111", "name": "Mine", "symbol": "MINE", "decimals": 18 }
+      - title: "Start the daemon"
+        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
+        code_block: "logoscore -D -m ./modules > logs.txt &"
+      - run: "sleep 3"
+      - title: "Load the module"
+        run: "./logos/bin/logoscore load-module token_list_module"
+        expect_contains:
+          - "token_list_module"
+      - title: "Configure the list URL"
+        run: "./logos/bin/logoscore call token_list_module configure @tl_config.json"
+        code_block: "logoscore call token_list_module configure @tl_config.json"
+        expect_contains:
+          - "true"
+      - title: "Refresh (fetch + parse + merge)"
+        run: "./logos/bin/logoscore call token_list_module refresh_now"
+        code_block: "logoscore call token_list_module refresh_now"
+        expect_contains:
+          - "tokenCount"
+      - title: "Read merged tokens for chain 1"
+        run: "./logos/bin/logoscore call token_list_module get_tokens 1"
+        code_block: "logoscore call token_list_module get_tokens 1"
+        expect_contains:
+          - "USDC"
+          - "USDT"
+      - title: "Add a custom token"
+        run: "./logos/bin/logoscore call token_list_module add_custom_token @custom_token.json"
+        code_block: "logoscore call token_list_module add_custom_token @custom_token.json"
+        expect_contains:
+          - "true"
+      - title: "The custom token now appears"
+        run: "./logos/bin/logoscore call token_list_module get_tokens 1"
+        expect_contains:
+          - "MINE"
+      - title: "List the configured sources"
+        run: "./logos/bin/logoscore call token_list_module get_list_sources"
+        expect_contains:
+          - "Test List"
+      - title: "Fail-closed: refuse a fetch when a proxy is required"
+        run: |
+          ./logos/bin/logoscore call token_list_module configure @tl_config_fc.json
+          ./logos/bin/logoscore call token_list_module refresh_now
+        code_block: |
+          logoscore call token_list_module configure @tl_config_fc.json
+          logoscore call token_list_module refresh_now
+        expect_contains:
+          - "proxy required"
+      - title: "Stop the daemon and the file server"
+        run: |
+          ./logos/bin/logoscore stop
+          pkill -f "http.server 8601" 2>/dev/null || true
+      - run: "sleep 2"
+      - title: "Confirm the daemon has stopped"
+        run: "./logos/bin/logoscore status || true"
+        expect_contains:
+          - '"status":"not_running"'
