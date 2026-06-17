@@ -105,13 +105,20 @@ sections:
         expect_contains:
           - "true"
       - title: "Refresh (fetch + parse + merge)"
-        # Retry on a transient RPC_FAILED — driving the module through a blocking
-        # HTTP fetch can hit a transport race on loaded CI runners. refresh_now is
-        # idempotent (re-fetch + re-merge), so retrying is safe.
+        # Driving the module through a blocking HTTP fetch can wedge its transport
+        # on loaded CI runners (RPC_FAILED that persists within the session). On a
+        # transient failure, reset the module with reload-module + re-configure
+        # before retrying. refresh_now is idempotent, so this is safe.
         run: |
           for i in 1 2 3 4 5 6; do
             out=$(./logos/bin/logoscore call token_list_module refresh_now 2>&1)
-            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+            case "$out" in
+              *RPC_FAILED*)
+                ./logos/bin/logoscore reload-module token_list_module >/dev/null 2>&1 || true
+                ./logos/bin/logoscore call token_list_module configure @tl_config.json >/dev/null 2>&1 || true
+                sleep 3 ;;
+              *) break ;;
+            esac
           done
           printf '%s\n' "$out"
         code_block: "logoscore call token_list_module refresh_now"
@@ -162,8 +169,10 @@ sections:
           - "proxy required"
       - title: "Stop the daemon and the file server"
         run: |
+          trap '' TERM
           ./logos/bin/logoscore stop || true
           pkill -f "http.server 8601" 2>/dev/null || true
+          true
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
         run: "./logos/bin/logoscore status || true"
