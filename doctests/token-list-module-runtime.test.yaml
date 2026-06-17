@@ -139,7 +139,7 @@ sections:
           - "proxy required"
       - title: "Stop the daemon and the file server"
         run: |
-          ./logos/bin/logoscore stop
+          ./logos/bin/logoscore stop || true
           pkill -f "http.server 8601" 2>/dev/null || true
       - run: "sleep 2"
       - title: "Confirm the daemon has stopped"
