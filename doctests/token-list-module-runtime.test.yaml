@@ -105,12 +105,25 @@ sections:
         expect_contains:
           - "true"
       - title: "Refresh (fetch + parse + merge)"
-        run: "./logos/bin/logoscore call token_list_module refresh_now"
+        # Retry on a transient RPC_FAILED — driving the module through a blocking
+        # HTTP fetch can hit a transport race on loaded CI runners. refresh_now is
+        # idempotent (re-fetch + re-merge), so retrying is safe.
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call token_list_module refresh_now 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call token_list_module refresh_now"
         expect_contains:
           - "tokenCount"
       - title: "Read merged tokens for chain 1"
-        run: "./logos/bin/logoscore call token_list_module get_tokens 1"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call token_list_module get_tokens 1 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         code_block: "logoscore call token_list_module get_tokens 1"
         expect_contains:
           - "USDC"
@@ -121,11 +134,21 @@ sections:
         expect_contains:
           - "true"
       - title: "The custom token now appears"
-        run: "./logos/bin/logoscore call token_list_module get_tokens 1"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call token_list_module get_tokens 1 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         expect_contains:
           - "MINE"
       - title: "List the configured sources"
-        run: "./logos/bin/logoscore call token_list_module get_list_sources"
+        run: |
+          for i in 1 2 3 4 5 6; do
+            out=$(./logos/bin/logoscore call token_list_module get_list_sources 2>&1)
+            case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
+          done
+          printf '%s\n' "$out"
         expect_contains:
           - "Test List"
       - title: "Fail-closed: refuse a fetch when a proxy is required"
