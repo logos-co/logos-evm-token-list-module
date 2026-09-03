@@ -10,7 +10,10 @@
 mod proxy;
 mod tokens;
 
-pub use tokens::{ListConfig, ListSource, Token, TokenError, TokenList};
+pub use tokens::{
+    changed_chains, ChainDigests, ConfigSource, Counts, ListConfig, ListConfigWire, ListSource,
+    Token, TokenError, TokenList, TokenRow, TokenSource,
+};
 
 #[cfg(feature = "logos_module")]
 mod glue;
