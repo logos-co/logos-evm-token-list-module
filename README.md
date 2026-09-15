@@ -1,7 +1,7 @@
 # logos-evm-token-list-module
 
-A Logos `core` module (Rust, rust-first cdylib) that manages **token lists** for
-the Logos multi-chain EVM wallet: download, parse, and merge
+A Logos `core` module (Rust, rust-first cdylib) that manages the reusable EVM
+token catalogue and each device's **enabled ERC-20 set**: download, parse, and merge
 [Uniswap token-lists](https://github.com/Uniswap/token-lists) plus a user "custom"
 list and a **shipped offline list**, deduped per chain.
 
@@ -30,13 +30,24 @@ once `list_config.json` exists, and `applied: false` is an answer, not an error.
 Callers must gate on `state == "unconfigured"` — this module holds one config
 record, so an unconditional call would be a whole-record write.
 
-## Three buckets, in precedence order
+## Catalogue and offered set
 
-`custom` → `downloaded` → `embedded`. Every reply row carries the bucket that
+`builtin` → `custom` → `downloaded` → `embedded`. Every reply row carries the bucket that
 answered it in a `source` field, so a consumer never has to guess. `refresh_now`
 replaces the `downloaded` bucket only; a refresh in which every URL fails
 degrades to `custom + embedded` instead of to nothing. The embedded list is
 never persisted, never written, and unreachable from any network path.
+
+The only pinned built-in is canonical mainnet WETH. Sepolia and Hoodi
+deliberately have none: multiple incompatible contracts use that name and no
+network-wide registry identifies one as canonical. Built-ins outrank every
+catalogue bucket and cannot be disabled.
+
+Enabling a token snapshots its complete catalogue record into
+`enabled_tokens.json`. That keeps symbol, name and especially decimals stable if
+a remote list changes or disappears. Writes use a temporary file and rename.
+Native currencies are intentionally absent: chain metadata belongs to
+`eth_rpc_module`, and callers compose the native row themselves.
 
 ## Contract (`TokenListModule`)
 
@@ -46,9 +57,13 @@ never persisted, never written, and unreachable from any network path.
 | `config_status()` | no network I/O; cheap on a consumer's startup path |
 | `init_defaults()` | applies the offline defaults where nothing is configured |
 | `refresh_now()` | the only method that fetches; nothing schedules it |
-| `get_tokens(chainId)` | merged rows, each labelled `custom`/`downloaded`/`embedded` |
+| `get_tokens(chainId)` | merged catalogue rows, labelled `builtin`/`custom`/`downloaded`/`embedded` |
 | `get_tokens_by_address(chainId, addressesJson)` | narrow query; 94 KB → 449 B for a two-token wallet refresh |
 | `get_all_tokens()` | ~360 KB with the shipped list active |
+| `set_token_enabled(chainId, address, enabled)` | snapshot or remove one catalogue token; pinned rows cannot be disabled |
+| `get_enabled_tokens(chainId)` | stored snapshots with a `resolved` flag |
+| `list_offered(chainId)` | pinned rows, then enabled snapshots; ERC-20 only |
+| `list_available(chainId, query, offset, limit)` | offered first, then the remaining catalogue; searchable and paged |
 | `add_custom_token(tokenJson)` | one user token |
 | `import_custom_tokens(listJson, replace)` | bulk ingest of one Uniswap-schema document; no network → `{ ok, tokenCount }` |
 | `remove_custom_token(chainId, address)` | |
@@ -97,7 +112,7 @@ somebody configured it.
 ## Build & test
 
 ```bash
-cd rust-lib && cargo test --no-default-features   # core: parse/merge/precedence/defaults
+cd rust-lib && cargo test --no-default-features   # core: catalogue/offered/persistence/paging
 nix build .#install                                # -> result/modules/token_list_module/
 ```
 

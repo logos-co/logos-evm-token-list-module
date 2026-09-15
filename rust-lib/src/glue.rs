@@ -33,13 +33,29 @@ pub trait TokenListModule: Send + 'static {
     fn init_defaults(&mut self) -> String;
     /// Fetch all configured lists through the fail-closed proxy → `{ ok, tokenCount }`.
     fn refresh_now(&mut self) -> String;
-    /// Merged custom + downloaded + embedded tokens for a chain, each row
+    /// Merged builtin + custom + downloaded + embedded tokens for a chain, each row
     /// labelled with the bucket it came from → `{ ok, tokens: [...] }`.
     fn get_tokens(&mut self, chain_id: i64) -> String;
     /// Metadata for specific tokens only; `addresses_json` is a JSON array of
     /// hex addresses matched case-insensitively → `{ ok, tokens: [...] }`.
     fn get_tokens_by_address(&mut self, chain_id: i64, addresses_json: String) -> String;
     fn get_all_tokens(&mut self) -> String;
+    /// Enable snapshots the catalogue row; disabling removes the snapshot. Pinned rows cannot
+    /// be disabled. `{ ok, chainId, address, enabled, changed }`.
+    fn set_token_enabled(&mut self, chain_id: i64, address: String, enabled: bool) -> String;
+    /// Persisted snapshots for one chain, each with `resolved` saying whether a current
+    /// catalogue bucket still describes the address.
+    fn get_enabled_tokens(&mut self, chain_id: i64) -> String;
+    /// Pinned rows followed by enabled snapshots. ERC-20 only.
+    fn list_offered(&mut self, chain_id: i64) -> String;
+    /// Offered rows first, then the rest of the catalogue, with search and pagination.
+    fn list_available(
+        &mut self,
+        chain_id: i64,
+        query: String,
+        offset: i64,
+        limit: i64,
+    ) -> String;
     /// Add a user token: `{ chainId, address, name, symbol, decimals, logoURI? }`.
     fn add_custom_token(&mut self, token_json: String) -> bool;
     /// Bulk-ingest one Uniswap-schema document into the CUSTOM list; the caller
@@ -97,6 +113,10 @@ impl TokenListModuleImpl {
 
 fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
+}
+
+fn bad_chain() -> String {
+    json!({ "ok": false, "code": "bad_chain", "error": "chainId must be non-negative" }).to_string()
 }
 
 /// The `source` as `config_status` spells it — same serde rename, so the event
@@ -197,6 +217,7 @@ impl TokenListModule for TokenListModuleImpl {
     }
 
     fn get_tokens(&mut self, chain_id: i64) -> String {
+        if chain_id < 0 { return bad_chain(); }
         match self.tl() {
             Ok(tl) => json!({ "ok": true, "tokens": tl.get_tokens(chain_id as u64) }).to_string(),
             Err(e) => err(e),
@@ -204,6 +225,7 @@ impl TokenListModule for TokenListModuleImpl {
     }
 
     fn get_tokens_by_address(&mut self, chain_id: i64, addresses_json: String) -> String {
+        if chain_id < 0 { return bad_chain(); }
         let addresses: Vec<String> = match serde_json::from_str(&addresses_json) {
             Ok(a) => a,
             Err(e) => return err(e),
@@ -217,6 +239,51 @@ impl TokenListModule for TokenListModuleImpl {
     fn get_all_tokens(&mut self) -> String {
         match self.tl() {
             Ok(tl) => json!({ "ok": true, "tokens": tl.get_all_tokens() }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn set_token_enabled(&mut self, chain_id: i64, address: String, enabled: bool) -> String {
+        if chain_id < 0 {
+            return bad_chain();
+        }
+        match self.with_chain_events(|tl| tl.set_token_enabled(chain_id as u64, &address, enabled)) {
+            Ok(Ok(changed)) => json!({ "ok": true, "chainId": chain_id, "address": address,
+                                       "enabled": enabled, "changed": changed }).to_string(),
+            Ok(Err(e)) => json!({ "ok": false, "code": e.code(), "error": e.to_string() }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn get_enabled_tokens(&mut self, chain_id: i64) -> String {
+        if chain_id < 0 { return bad_chain(); }
+        match self.tl() {
+            Ok(tl) => json!({ "ok": true, "chainId": chain_id,
+                              "tokens": tl.get_enabled_tokens(chain_id as u64) }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn list_offered(&mut self, chain_id: i64) -> String {
+        if chain_id < 0 { return bad_chain(); }
+        match self.tl() {
+            Ok(tl) => json!({ "ok": true, "chainId": chain_id,
+                              "tokens": tl.list_offered(chain_id as u64) }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn list_available(&mut self, chain_id: i64, query: String, offset: i64, limit: i64) -> String {
+        if chain_id < 0 { return bad_chain(); }
+        let offset = usize::try_from(offset).unwrap_or(0);
+        let limit = usize::try_from(limit).ok().filter(|n| *n > 0);
+        match self.tl() {
+            Ok(tl) => {
+                let (total, listed, tokens) = tl.list_available(chain_id as u64, &query, offset, limit);
+                json!({ "ok": true, "chainId": chain_id, "total": total, "offset": offset,
+                        "shown": tokens.len(), "hasMore": offset.saturating_add(tokens.len()) < total,
+                        "listed": listed, "tokens": tokens }).to_string()
+            }
             Err(e) => err(e),
         }
     }

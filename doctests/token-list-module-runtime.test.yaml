@@ -10,14 +10,16 @@ intro: |
 
   This doc-test drives the module through a `logoscore` daemon against a **local
   static file server** (offline, reproducible): it configures a list URL,
-  refreshes, reads the merged tokens, adds a custom token, and finally shows the
-  fail-closed refusal when a proxy is required but unavailable.
+  refreshes, reads the merged tokens, enables a token, pages the picker, and
+  finally shows the fail-closed refusal when a proxy is required but unavailable.
 
 what_you_build: "This `token_list_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local list server."
 
 what_you_learn:
   - How list URLs are configured and fetched into the module
   - How downloaded lists merge with a user custom list (deduped per chain)
+  - How an enabled token becomes a persisted offered-row snapshot
+  - How the offered-first picker supports search and pagination
   - How the fail-closed proxy chokepoint refuses a fetch when a proxy is required but unavailable
 
 prerequisites:
@@ -149,6 +151,26 @@ sections:
           printf '%s\n' "$out"
         expect_contains:
           - "MINE"
+      - title: "Enable USDC from the catalogue"
+        run: "./logos/bin/logoscore call token_list_module set_token_enabled 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true"
+        code_block: "logoscore call token_list_module set_token_enabled 1 0xA0b8... true"
+        expect_contains:
+          - '\"enabled\":true'
+          - '\"changed\":true'
+      - title: "Read the offered ERC-20 set"
+        run: "./logos/bin/logoscore call token_list_module list_offered 1"
+        code_block: "logoscore call token_list_module list_offered 1"
+        expect_contains:
+          - "WETH"
+          - "USDC"
+          - '\"builtin\":true'
+      - title: "Search the offered-first picker"
+        run: "./logos/bin/logoscore call token_list_module list_available 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 0 10"
+        code_block: "logoscore call token_list_module list_available 1 0xA0b8... 0 10"
+        expect_contains:
+          - '\"total\":1'
+          - "USDC"
+          - '\"hasMore\":false'
       - title: "List the configured sources"
         run: |
           for i in 1 2 3 4 5 6; do

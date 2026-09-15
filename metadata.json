@@ -1,7 +1,7 @@
 {
   "name": "token_list_module",
   "version": "1.0.0",
-  "description": "Uniswap token-lists: download, parse, merge multiple lists + a user custom list. Proxyable, fail-closed.",
+  "description": "Reusable EVM token catalogue, enabled snapshots, pinned assets and paged picker. Proxyable, fail-closed.",
   "author": "Logos Core Team",
   "type": "core",
   "interface": "cdylib",
