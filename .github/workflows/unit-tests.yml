@@ -1,0 +1,48 @@
+name: token_list_module Unit Tests
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: unit-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-test:
+    name: cargo test (pure core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Provide the optional SDK manifest
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust-lib
+
+      - name: Run the pure core and source-shape guards
+        run: cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked
+
+      - name: Keep the contract guards and test floor present
+        run: |
+          out=$(cargo test --manifest-path rust-lib/Cargo.toml --no-default-features --locked -- --list)
+          for t in enabling_reads_the_catalogue_before_it_writes_the_snapshot \
+                   offered_readers_are_silent \
+                   the_enabled_mutator_uses_the_shared_chain_event_diff \
+                   persisted_enabled_sets_use_write_then_rename; do
+            echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
+          done
+          n=$(echo "$out" | grep -c ': test$')
+          echo "tests: $n"; [ "$n" -ge 65 ]

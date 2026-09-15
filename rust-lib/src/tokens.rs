@@ -16,7 +16,9 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::offered;
 use crate::proxy::{build_client, ProxyConfig};
+use crate::store;
 
 /// The shipped offline list. Embedded at compile time, not read from disk: a
 /// cdylib core module has a data directory and no resource directory.
@@ -46,6 +48,8 @@ pub struct Token {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TokenSource {
+    Builtin,
+    Enabled,
     Custom,
     Downloaded,
     Embedded,
@@ -57,6 +61,51 @@ pub struct TokenRow {
     #[serde(flatten)]
     pub token: Token,
     pub source: TokenSource,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub builtin: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct EnabledTokenRow {
+    #[serde(flatten)]
+    pub token: Token,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfferedError {
+    BadAddress,
+    UnknownToken,
+    Builtin,
+    Io,
+}
+
+impl OfferedError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::BadAddress => "bad_address",
+            Self::UnknownToken => "unknown_token",
+            Self::Builtin => "builtin",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl std::fmt::Display for OfferedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadAddress => write!(f, "address is not a 20-byte hex token address"),
+            Self::UnknownToken => write!(f, "the catalogue does not describe this token"),
+            Self::Builtin => write!(f, "a built-in token cannot be disabled"),
+            Self::Io => write!(f, "could not save the enabled token set"),
+        }
+    }
 }
 
 /// A token entry as it appears in a Uniswap token-list document (lenient).
@@ -250,6 +299,7 @@ pub struct TokenList {
     sources: Vec<ListSource>,
     downloaded: Vec<Token>,
     custom: Vec<Token>,
+    enabled: BTreeMap<u64, Vec<Token>>,
     dir: Option<PathBuf>,
 }
 
@@ -261,6 +311,7 @@ impl TokenList {
             sources: Vec::new(),
             downloaded: Vec::new(),
             custom: Vec::new(),
+            enabled: BTreeMap::new(),
             dir: None,
         }
     }
@@ -296,6 +347,12 @@ impl TokenList {
         }
     }
 
+    fn write_json_atomic<T: Serialize>(&self, name: &str, value: &T) -> bool {
+        let Some(path) = self.path(name) else { return true };
+        let Ok(text) = serde_json::to_string_pretty(value) else { return false };
+        store::write_then_rename(&path, &text)
+    }
+
     fn load(&mut self) {
         if let Some(txt) = self.read_text("list_config.json") {
             self.load_config(&txt);
@@ -305,6 +362,9 @@ impl TokenList {
         }
         if let Some(t) = self.read_json::<Vec<Token>>("custom_tokens.json") {
             self.custom = t;
+        }
+        if let Some(t) = self.read_json::<BTreeMap<u64, Vec<Token>>>("enabled_tokens.json") {
+            self.enabled = t;
         }
     }
 
@@ -409,8 +469,8 @@ impl TokenList {
         Ok(self.downloaded.len())
     }
 
-    /// Merge custom → downloaded → embedded for `chain_id`, deduped by address:
-    /// the user's own entry wins, then a list they refreshed, then the floor.
+    /// Merge pinned → custom → downloaded → embedded for `chain_id`, deduped by
+    /// address. A network fact this module vouches for wins every catalogue bucket.
     pub fn get_tokens(&self, chain_id: u64) -> Vec<TokenRow> {
         self.rows(chain_id, None)
     }
@@ -424,7 +484,9 @@ impl TokenList {
     }
 
     fn rows(&self, chain_id: u64, want: Option<&HashSet<String>>) -> Vec<TokenRow> {
+        let pinned = offered::pinned(chain_id);
         let buckets = [
+            (TokenSource::Builtin, pinned.as_slice()),
             (TokenSource::Custom, self.custom.as_slice()),
             (TokenSource::Downloaded, self.downloaded.as_slice()),
             (TokenSource::Embedded, self.embedded()),
@@ -441,7 +503,13 @@ impl TokenList {
                     continue;
                 }
                 if seen.insert(key) {
-                    out.push(TokenRow { token: t.clone(), source });
+                    out.push(TokenRow {
+                        token: t.clone(),
+                        source,
+                        enabled: self.is_enabled(chain_id, &t.address)
+                            || source == TokenSource::Builtin,
+                        builtin: source == TokenSource::Builtin,
+                    });
                 }
             }
         }
@@ -503,7 +571,8 @@ impl TokenList {
         if changed {
             self.write_json("custom_tokens.json", &self.custom);
         }
-        changed
+        let enabled_changed = self.remove_enabled(chain_id, address).unwrap_or(false);
+        changed || enabled_changed
     }
 
     pub fn get_custom_tokens(&self) -> &[Token] {
@@ -518,6 +587,7 @@ impl TokenList {
             .map(|c| {
                 let mut h = DefaultHasher::new();
                 self.get_tokens(c).hash(&mut h);
+                self.list_offered(c).hash(&mut h);
                 (c, h.finish())
             })
             .collect()
@@ -525,7 +595,14 @@ impl TokenList {
 
     /// Distinct chain ids across every bucket (sorted).
     pub fn chains(&self) -> Vec<u64> {
-        Self::distinct(self.custom.iter().chain(self.downloaded.iter()).chain(self.embedded()))
+        let mut chains = Self::distinct(
+            self.custom.iter().chain(self.downloaded.iter()).chain(self.embedded()),
+        );
+        chains.extend(offered::chains());
+        chains.extend(self.enabled.keys().copied());
+        chains.sort_unstable();
+        chains.dedup();
+        chains
     }
 
     fn distinct<'a>(it: impl Iterator<Item = &'a Token>) -> Vec<u64> {
@@ -537,6 +614,150 @@ impl TokenList {
 
     pub fn get_list_sources(&self) -> &[ListSource] {
         &self.sources
+    }
+
+    fn is_enabled(&self, chain_id: u64, address: &str) -> bool {
+        self.enabled
+            .get(&chain_id)
+            .is_some_and(|rows| rows.iter().any(|t| t.address.eq_ignore_ascii_case(address)))
+    }
+
+    fn valid_address(address: &str) -> bool {
+        let raw = address
+            .trim()
+            .strip_prefix("0x")
+            .or_else(|| address.trim().strip_prefix("0X"))
+            .unwrap_or("");
+        raw.len() == 40 && raw.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn remove_enabled(&mut self, chain_id: u64, address: &str) -> Result<bool, OfferedError> {
+        let before_all = self.enabled.clone();
+        let Some(rows) = self.enabled.get_mut(&chain_id) else { return Ok(false) };
+        let before = rows.len();
+        rows.retain(|t| !t.address.eq_ignore_ascii_case(address.trim()));
+        let changed = rows.len() != before;
+        if rows.is_empty() {
+            self.enabled.remove(&chain_id);
+        }
+        if changed && !self.write_json_atomic("enabled_tokens.json", &self.enabled) {
+            self.enabled = before_all;
+            return Err(OfferedError::Io);
+        }
+        Ok(changed)
+    }
+
+    pub fn set_token_enabled(
+        &mut self,
+        chain_id: u64,
+        address: &str,
+        enabled: bool,
+    ) -> Result<bool, OfferedError> {
+        let address = address.trim();
+        if !Self::valid_address(address) {
+            return Err(OfferedError::BadAddress);
+        }
+        if offered::is_pinned(chain_id, address) {
+            return if enabled { Ok(false) } else { Err(OfferedError::Builtin) };
+        }
+        if !enabled {
+            return self.remove_enabled(chain_id, address);
+        }
+        let token = self
+            .get_tokens(chain_id)
+            .into_iter()
+            .find(|row| row.token.address.eq_ignore_ascii_case(address))
+            .map(|row| row.token)
+            .filter(|token| !token.symbol.trim().is_empty())
+            .ok_or(OfferedError::UnknownToken)?;
+        let before = self.enabled.clone();
+        let rows = self.enabled.entry(chain_id).or_default();
+        rows.retain(|t| !t.address.eq_ignore_ascii_case(address));
+        rows.push(token);
+        rows.sort_by_cached_key(|t| (t.symbol.to_ascii_lowercase(), norm(&t.address)));
+        let changed = self.enabled != before;
+        if changed && !self.write_json_atomic("enabled_tokens.json", &self.enabled) {
+            self.enabled = before;
+            return Err(OfferedError::Io);
+        }
+        Ok(changed)
+    }
+
+    pub fn get_enabled_tokens(&self, chain_id: u64) -> Vec<EnabledTokenRow> {
+        self.enabled
+            .get(&chain_id)
+            .into_iter()
+            .flatten()
+            .map(|token| EnabledTokenRow {
+                resolved: self
+                    .get_tokens(chain_id)
+                    .iter()
+                    .any(|row| row.token.address.eq_ignore_ascii_case(&token.address)),
+                token: token.clone(),
+            })
+            .collect()
+    }
+
+    pub fn list_offered(&self, chain_id: u64) -> Vec<TokenRow> {
+        let catalogue = self.get_tokens(chain_id);
+        let mut out: Vec<TokenRow> = catalogue.iter().filter(|row| row.builtin).cloned().collect();
+        let mut enabled: Vec<TokenRow> = self
+            .enabled
+            .get(&chain_id)
+            .into_iter()
+            .flatten()
+            .filter(|token| !offered::is_pinned(chain_id, &token.address))
+            .map(|token| {
+                let current = catalogue
+                    .iter()
+                    .find(|row| row.token.address.eq_ignore_ascii_case(&token.address));
+                TokenRow {
+                    token: token.clone(),
+                    source: current.map(|row| row.source).unwrap_or(TokenSource::Enabled),
+                    enabled: true,
+                    builtin: false,
+                }
+            })
+            .collect();
+        enabled.sort_by_cached_key(|row| {
+            (row.token.symbol.to_ascii_lowercase(), norm(&row.token.address))
+        });
+        out.extend(enabled);
+        out
+    }
+
+    pub fn list_available(
+        &self,
+        chain_id: u64,
+        query: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> (usize, usize, Vec<TokenRow>) {
+        let catalogue = self.get_tokens(chain_id);
+        let listed = catalogue.len();
+        let mut rows = self.list_offered(chain_id);
+        let mut seen: HashSet<String> = rows.iter().map(|row| norm(&row.token.address)).collect();
+        let mut rest: Vec<TokenRow> = catalogue
+            .into_iter()
+            .filter(|row| seen.insert(norm(&row.token.address)))
+            .collect();
+        rest.sort_by_cached_key(|row| {
+            (row.token.symbol.to_ascii_lowercase(), norm(&row.token.address))
+        });
+        rows.extend(rest);
+        rows.retain(|row| {
+            let q = query.trim();
+            q.is_empty()
+                || row.token.address.eq_ignore_ascii_case(q)
+                || row.token.symbol.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
+                || row.token.name.to_ascii_lowercase().contains(&q.to_ascii_lowercase())
+        });
+        let total = rows.len();
+        let mut page: Vec<TokenRow> = rows.into_iter().skip(offset).collect();
+        if let Some(limit) = limit {
+            page.truncate(limit);
+        }
+        (total, listed, page)
     }
 }
 
@@ -646,7 +867,7 @@ mod tests {
             logo_uri: None,
         });
         let chain1 = tl.get_tokens(1);
-        assert_eq!(chain1.len(), 2); // USDC (deduped) + USDT
+        assert_eq!(chain1.len(), 3); // pinned WETH + USDC (deduped) + USDT
         let usdc = find(&chain1, "USDC");
         assert_eq!(usdc.token.name, "My USDC"); // custom won
         assert_eq!(usdc.source, TokenSource::Custom);
@@ -679,7 +900,7 @@ mod tests {
         tl.configure(ListConfig { list_urls: vec![url], timeout_secs: 5, ..offline() });
         let n = tl.refresh_now().unwrap();
         assert_eq!(n, 3);
-        assert_eq!(tl.get_tokens(1).len(), 2);
+        assert_eq!(tl.get_tokens(1).len(), 3);
         assert!(tl.get_list_sources()[0].ok);
     }
 
@@ -719,12 +940,15 @@ mod tests {
     }
 
     #[test]
-    fn turning_the_floor_off_empties_the_embedded_bucket() {
+    fn turning_the_floor_off_leaves_only_the_pinned_bucket() {
         let mut tl = TokenList::new();
         assert_eq!(tl.counts().embedded, 1709);
         tl.configure(ListConfig { use_embedded_list: false, ..ListConfig::default() });
         assert_eq!(tl.counts().embedded, 0);
-        assert!(tl.get_tokens(1).is_empty());
+        let rows = tl.get_tokens(1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source, TokenSource::Builtin);
+        assert_eq!(rows[0].token.symbol, "WETH");
     }
 
     // ---- default initialization ---------------------------------------------
@@ -848,7 +1072,7 @@ mod tests {
         let before = tl.chain_digests();
         tl.configure(ListConfig { use_embedded_list: false, ..ListConfig::default() });
         let after = tl.chain_digests();
-        assert!(after.is_empty());
+        assert_eq!(after.keys().copied().collect::<Vec<_>>(), vec![1]);
         assert_eq!(changed_chains(&before, &after).len(), 25);
     }
 
@@ -866,7 +1090,7 @@ mod tests {
         let before = tl.chain_digests();
         tl.configure(ListConfig { list_urls: vec!["http://127.0.0.1:1/l.json".into()], timeout_secs: 2, ..offline() });
         tl.refresh_now().unwrap();
-        assert!(tl.chain_digests().is_empty());
+        assert_eq!(tl.chain_digests().keys().copied().collect::<Vec<_>>(), vec![1]);
         assert_eq!(changed_chains(&before, &tl.chain_digests()), vec![1, 10]);
     }
 
@@ -1028,6 +1252,268 @@ mod tests {
         assert!(tl.get_custom_tokens().is_empty());
     }
 
+    // ---- the offered set ----------------------------------------------------
+
+    const WETH: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+    const DAI: &str = "0x6B175474E89094C44Da98b954EedeAC495271d0F";
+
+    fn token(chain_id: u64, symbol: &str, name: &str, decimals: u8, address: &str) -> Token {
+        Token {
+            chain_id,
+            address: address.into(),
+            name: name.into(),
+            symbol: symbol.into(),
+            decimals,
+            logo_uri: None,
+        }
+    }
+
+    fn symbols(rows: &[TokenRow]) -> Vec<String> {
+        rows.iter().map(|row| row.token.symbol.clone()).collect()
+    }
+
+    #[test]
+    fn only_mainnet_has_a_pinned_token() {
+        assert_eq!(symbols(&TokenList::new().list_offered(1)), ["WETH"]);
+        assert!(TokenList::new().list_offered(11_155_111).is_empty());
+        assert!(TokenList::new().list_offered(560_048).is_empty());
+    }
+
+    #[test]
+    fn the_pinned_row_is_enabled_builtin_and_first() {
+        let row = TokenList::new().list_offered(1).remove(0);
+        assert_eq!(row.source, TokenSource::Builtin);
+        assert!(row.enabled && row.builtin);
+        assert_eq!((row.token.symbol.as_str(), row.token.decimals), ("WETH", 18));
+    }
+
+    #[test]
+    fn a_pinned_row_outranks_a_custom_copy() {
+        let mut tl = TokenList::new();
+        tl.add_custom_token(token(1, "WETH9", "Wrong", 6, &WETH.to_lowercase()));
+        let row = tl.get_tokens_by_address(1, &[WETH.into()]).remove(0);
+        assert_eq!((row.token.symbol.as_str(), row.token.decimals), ("WETH", 18));
+        assert_eq!(row.source, TokenSource::Builtin);
+    }
+
+    #[test]
+    fn a_pinned_row_cannot_be_disabled() {
+        let mut tl = TokenList::new();
+        assert_eq!(tl.set_token_enabled(1, WETH, false), Err(OfferedError::Builtin));
+        assert_eq!(symbols(&tl.list_offered(1)), ["WETH"]);
+    }
+
+    #[test]
+    fn enabling_a_pinned_row_is_a_silent_noop() {
+        let mut tl = TokenList::new();
+        assert_eq!(tl.set_token_enabled(1, &WETH.to_lowercase(), true), Ok(false));
+        assert!(tl.get_enabled_tokens(1).is_empty());
+    }
+
+    #[test]
+    fn malformed_addresses_are_refused() {
+        let mut tl = TokenList::new();
+        for address in ["", "0x", "0xnothex", "1234", "0x000000000000000000000000000000000000000z"] {
+            assert_eq!(tl.set_token_enabled(1, address, true), Err(OfferedError::BadAddress));
+        }
+    }
+
+    #[test]
+    fn an_unknown_address_is_never_snapshotted() {
+        let mut tl = TokenList::new();
+        let unknown = "0x0000000000000000000000000000000000000001";
+        assert_eq!(tl.set_token_enabled(1, unknown, true), Err(OfferedError::UnknownToken));
+        assert!(tl.get_enabled_tokens(1).is_empty());
+    }
+
+    #[test]
+    fn enabling_snapshots_every_catalogue_field() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC)];
+        assert_eq!(tl.set_token_enabled(1, &USDC.to_lowercase(), true), Ok(true));
+        let row = tl.get_enabled_tokens(1).remove(0);
+        assert_eq!(row.token, token(1, "USDC", "USD Coin", 6, USDC));
+        assert!(row.resolved);
+    }
+
+    #[test]
+    fn the_enabled_snapshot_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut tl = TokenList::with_dir(dir.path().to_path_buf());
+            tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC)];
+            assert_eq!(tl.set_token_enabled(1, USDC, true), Ok(true));
+        }
+        let tl = TokenList::with_dir(dir.path().to_path_buf());
+        assert_eq!(tl.get_enabled_tokens(1)[0].token.decimals, 6);
+        assert_eq!(symbols(&tl.list_offered(1)), ["WETH", "USDC"]);
+    }
+
+    #[test]
+    fn enabled_sets_are_independent_per_chain() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC), token(10, "USDC", "USD Coin", 6, USDC)];
+        assert_eq!(tl.set_token_enabled(10, USDC, true), Ok(true));
+        assert!(tl.get_enabled_tokens(1).is_empty());
+        assert_eq!(symbols(&tl.list_offered(10)), ["USDC"]);
+    }
+
+    #[test]
+    fn re_enabling_refreshes_a_changed_snapshot() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "Old name", 6, USDC)];
+        assert_eq!(tl.set_token_enabled(1, USDC, true), Ok(true));
+        tl.downloaded[0].name = "USD Coin".into();
+        assert_eq!(tl.set_token_enabled(1, USDC, true), Ok(true));
+        assert_eq!(tl.get_enabled_tokens(1)[0].token.name, "USD Coin");
+        assert_eq!(tl.set_token_enabled(1, USDC, true), Ok(false));
+    }
+
+    #[test]
+    fn disabling_is_case_insensitive_and_idempotent() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC)];
+        tl.set_token_enabled(1, USDC, true).unwrap();
+        assert_eq!(tl.set_token_enabled(1, &USDC.to_lowercase(), false), Ok(true));
+        assert_eq!(tl.set_token_enabled(1, USDC, false), Ok(false));
+    }
+
+    #[test]
+    fn an_orphaned_snapshot_stays_offered_and_says_enabled() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(560_048, "TEST", "Test", 7, DAI)];
+        tl.set_token_enabled(560_048, DAI, true).unwrap();
+        tl.downloaded.clear();
+        let row = tl.list_offered(560_048).remove(0);
+        assert_eq!(row.source, TokenSource::Enabled);
+        assert_eq!(row.token.decimals, 7);
+        assert!(row.enabled && !row.builtin);
+        assert!(!tl.get_enabled_tokens(560_048)[0].resolved);
+    }
+
+    #[test]
+    fn removing_a_custom_token_also_removes_its_enabled_snapshot() {
+        let mut tl = TokenList::new();
+        tl.add_custom_token(token(10, "DAI", "Dai", 18, DAI));
+        tl.set_token_enabled(10, DAI, true).unwrap();
+        assert!(tl.remove_custom_token(10, DAI));
+        assert!(tl.get_enabled_tokens(10).is_empty());
+        assert!(tl.list_offered(10).is_empty());
+    }
+
+    #[test]
+    fn offered_rows_are_pinned_then_enabled_alphabetically() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC), token(1, "DAI", "Dai", 18, DAI)];
+        tl.set_token_enabled(1, USDC, true).unwrap();
+        tl.set_token_enabled(1, DAI, true).unwrap();
+        assert_eq!(symbols(&tl.list_offered(1)), ["WETH", "DAI", "USDC"]);
+    }
+
+    #[test]
+    fn enabling_does_not_turn_a_snapshot_into_a_catalogue_bucket() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = vec![token(10, "DAI", "Dai", 18, DAI)];
+        tl.set_token_enabled(10, DAI, true).unwrap();
+        tl.downloaded.clear();
+        assert!(tl.get_tokens(10).is_empty());
+        assert_eq!(symbols(&tl.list_offered(10)), ["DAI"]);
+    }
+
+    #[test]
+    fn the_picker_puts_offered_rows_before_the_rest() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC), token(1, "DAI", "Dai", 18, DAI)];
+        tl.set_token_enabled(1, USDC, true).unwrap();
+        let (total, listed, rows) = tl.list_available(1, "", 0, None);
+        assert_eq!((total, listed), (3, 3));
+        assert_eq!(symbols(&rows), ["WETH", "USDC", "DAI"]);
+    }
+
+    #[test]
+    fn the_picker_matches_symbol_name_and_exact_address() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = vec![token(10, "DAI", "Dai Stablecoin", 18, DAI)];
+        for query in ["dai", "stable", &DAI.to_lowercase()] {
+            assert_eq!(symbols(&tl.list_available(10, query, 0, None).2), ["DAI"]);
+        }
+        assert!(tl.list_available(10, "0x6B17", 0, None).2.is_empty());
+    }
+
+    #[test]
+    fn the_picker_total_is_before_pagination() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = (0..12).map(|i| token(10, &format!("T{i:02}"), "Token", 18, &format!("0x{i:040x}"))).collect();
+        let (total, listed, first) = tl.list_available(10, "", 0, Some(5));
+        assert_eq!((total, listed, first.len()), (12, 12, 5));
+        assert_eq!(symbols(&first), ["T00", "T01", "T02", "T03", "T04"]);
+    }
+
+    #[test]
+    fn picker_pages_tile_the_full_answer() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = (0..12).map(|i| token(10, &format!("T{i:02}"), "Token", 18, &format!("0x{:040x}", i + 1))).collect();
+        let mut got = Vec::new();
+        for offset in [0, 5, 10] {
+            let (total, _, page) = tl.list_available(10, "", offset, Some(5));
+            assert_eq!(total, 12);
+            got.extend(symbols(&page));
+        }
+        assert_eq!(got, symbols(&tl.list_available(10, "", 0, None).2));
+        assert!(tl.list_available(10, "", 99, Some(5)).2.is_empty());
+    }
+
+    #[test]
+    fn an_enabled_only_chain_remains_in_the_digest_union() {
+        let mut tl = TokenList::new();
+        tl.config = offline();
+        tl.downloaded = vec![token(560_048, "TEST", "Test", 18, DAI)];
+        tl.set_token_enabled(560_048, DAI, true).unwrap();
+        tl.downloaded.clear();
+        assert!(tl.chains().contains(&560_048));
+        assert!(tl.chain_digests().contains_key(&560_048));
+    }
+
+    #[test]
+    fn toggling_one_chain_moves_only_its_digest() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC), token(10, "DAI", "Dai", 18, DAI)];
+        let before = tl.chain_digests();
+        tl.set_token_enabled(10, DAI, true).unwrap();
+        assert_eq!(changed_chains(&before, &tl.chain_digests()), vec![10]);
+    }
+
+    #[test]
+    fn enabled_writes_leave_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tl = TokenList::with_dir(dir.path().to_path_buf());
+        tl.downloaded = vec![token(1, "USDC", "USD Coin", 6, USDC)];
+        tl.set_token_enabled(1, USDC, true).unwrap();
+        tl.set_token_enabled(1, USDC, false).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn enabled_and_builtin_flags_are_omitted_only_when_false() {
+        let mut tl = TokenList::new();
+        tl.downloaded = vec![token(10, "DAI", "Dai", 18, DAI)];
+        let plain = serde_json::to_value(&tl.get_tokens(10)[0]).unwrap();
+        assert!(plain.get("enabled").is_none() && plain.get("builtin").is_none());
+        tl.set_token_enabled(10, DAI, true).unwrap();
+        let enabled = serde_json::to_value(&tl.list_offered(10)[0]).unwrap();
+        assert_eq!(enabled["enabled"], true);
+        assert!(enabled.get("builtin").is_none());
+    }
+
     // ---- the wire type -------------------------------------------------------
 
     /// Every reply type speaks one dialect. `ListSource` used to leak
@@ -1040,7 +1526,12 @@ mod tests {
             serde_json::json!({"url":"http://x/l.json","name":"L","tokenCount":7,"ok":true})
         );
         let (_n, tokens) = parse_list(LIST).unwrap();
-        let row = TokenRow { token: tokens[0].clone(), source: TokenSource::Downloaded };
+        let row = TokenRow {
+            token: tokens[0].clone(),
+            source: TokenSource::Downloaded,
+            enabled: false,
+            builtin: false,
+        };
         let mut keys: Vec<String> = serde_json::to_value(&row).unwrap().as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(keys, ["address", "chainId", "decimals", "logoURI", "name", "source", "symbol"]);
