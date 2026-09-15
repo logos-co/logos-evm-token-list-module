@@ -155,22 +155,22 @@ sections:
         run: "./logos/bin/logoscore call token_list_module set_token_enabled 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true"
         code_block: "logoscore call token_list_module set_token_enabled 1 0xA0b8... true"
         expect_contains:
-          - '"enabled":true'
-          - '"changed":true'
+          - '\"enabled\":true'
+          - '\"changed\":true'
       - title: "Read the offered ERC-20 set"
         run: "./logos/bin/logoscore call token_list_module list_offered 1"
         code_block: "logoscore call token_list_module list_offered 1"
         expect_contains:
           - "WETH"
           - "USDC"
-          - '"builtin":true'
+          - '\"builtin\":true'
       - title: "Search the offered-first picker"
         run: "./logos/bin/logoscore call token_list_module list_available 1 usd 0 10"
         code_block: "logoscore call token_list_module list_available 1 usd 0 10"
         expect_contains:
-          - '"total":1'
+          - '\"total\":1'
           - "USDC"
-          - '"hasMore":false'
+          - '\"hasMore\":false'
       - title: "List the configured sources"
         run: |
           for i in 1 2 3 4 5 6; do
