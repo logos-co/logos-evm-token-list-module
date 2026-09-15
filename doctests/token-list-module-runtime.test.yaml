@@ -165,8 +165,8 @@ sections:
           - "USDC"
           - '\"builtin\":true'
       - title: "Search the offered-first picker"
-        run: "./logos/bin/logoscore call token_list_module list_available 1 usd 0 10"
-        code_block: "logoscore call token_list_module list_available 1 usd 0 10"
+        run: "./logos/bin/logoscore call token_list_module list_available 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 0 10"
+        code_block: "logoscore call token_list_module list_available 1 0xA0b8... 0 10"
         expect_contains:
           - '\"total\":1'
           - "USDC"
