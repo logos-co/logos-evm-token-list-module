@@ -1,6 +1,6 @@
 {
   "name": "token_list_module",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Reusable EVM token catalogue, enabled snapshots, pinned assets and paged picker. Proxyable, fail-closed.",
   "author": "Logos Core Team",
   "type": "core",
