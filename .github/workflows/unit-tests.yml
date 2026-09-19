@@ -41,8 +41,11 @@ jobs:
           for t in enabling_reads_the_catalogue_before_it_writes_the_snapshot \
                    offered_readers_are_silent \
                    the_enabled_mutator_uses_the_shared_chain_event_diff \
-                   persisted_enabled_sets_use_write_then_rename; do
+                   persisted_enabled_sets_use_write_then_rename \
+                   calls_are_dispatched_concurrently \
+                   a_refresh_fetches_with_the_store_released \
+                   tokens::tests::a_refresh_whose_lists_moved_while_it_fetched_is_discarded; do
             echo "$out" | grep -q "^$t: test$" || { echo "MISSING guard: $t"; exit 1; }
           done
           n=$(echo "$out" | grep -c ': test$')
-          echo "tests: $n"; [ "$n" -ge 65 ]
+          echo "tests: $n"; [ "$n" -ge 71 ]

@@ -253,6 +253,8 @@ pub enum TokenError {
     Http(String),
     Parse(String),
     Io(String),
+    /// The lists or proxy policy changed while a refresh was fetching.
+    Superseded,
 }
 
 impl std::fmt::Display for TokenError {
@@ -262,6 +264,9 @@ impl std::fmt::Display for TokenError {
             TokenError::Http(e) => write!(f, "http: {e}"),
             TokenError::Parse(e) => write!(f, "parse: {e}"),
             TokenError::Io(e) => write!(f, "io: {e}"),
+            TokenError::Superseded => {
+                write!(f, "the list configuration changed during the fetch; refresh again")
+            }
         }
     }
 }
@@ -445,13 +450,29 @@ impl TokenList {
     /// Fetch all configured list URLs through the fail-closed proxy, parse, and
     /// replace the downloaded set. Returns the total token count.
     pub fn refresh_now(&mut self) -> Result<usize, TokenError> {
-        let pc = ProxyConfig::new(self.config.proxy.clone(), self.config.proxy_required, self.config.timeout_secs);
-        let client = build_client(&pc).map_err(|e| TokenError::Proxy(e.to_string()))?;
+        let plan = self.refresh_plan();
+        let fetched = plan.fetch();
+        self.apply_refresh(&plan, fetched)
+    }
 
+    /// What a refresh fetches. Taken from the store, then fetched with the store released.
+    pub fn refresh_plan(&self) -> RefreshPlan {
+        RefreshPlan {
+            urls: self.config.list_urls.clone(),
+            proxy: ProxyConfig::new(self.config.proxy.clone(), self.config.proxy_required, self.config.timeout_secs),
+        }
+    }
+
+    /// Store what `plan` fetched: the per-URL outcomes and the merged downloaded set. Refused
+    /// when the lists or proxy policy moved since the plan was taken.
+    pub fn apply_refresh(&mut self, plan: &RefreshPlan, fetched: Fetched) -> Result<usize, TokenError> {
+        if *plan != self.refresh_plan() {
+            return Err(TokenError::Superseded);
+        }
         let mut merged: Vec<Token> = Vec::new();
         let mut sources: Vec<ListSource> = Vec::new();
-        for url in &self.config.list_urls {
-            match fetch_list(&client, url) {
+        for (url, outcome) in plan.urls.iter().zip(fetched?) {
+            match outcome {
                 Ok((name, tokens)) => {
                     sources.push(ListSource { url: url.clone(), name, token_count: tokens.len(), ok: true, error: None });
                     merged.extend(tokens);
@@ -767,10 +788,45 @@ impl Default for TokenList {
     }
 }
 
+/// Each list's outcome in `listUrls` order, or the client that could not be built.
+pub type Fetched = Result<Vec<Result<(String, Vec<Token>), TokenError>>, TokenError>;
+
+/// The lists a refresh fetches and the proxy policy it fetches them under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshPlan {
+    urls: Vec<String>,
+    proxy: ProxyConfig,
+}
+
+impl RefreshPlan {
+    /// All lists at once, so a refresh takes as long as its slowest list, not their sum.
+    pub fn fetch(&self) -> Fetched {
+        let client = build_client(&self.proxy).map_err(|e| TokenError::Proxy(e.to_string()))?;
+        Ok(std::thread::scope(|s| {
+            let jobs: Vec<_> = self.urls.iter().map(|url| s.spawn(|| fetch_list(&client, url))).collect();
+            jobs.into_iter()
+                .map(|j| j.join().unwrap_or_else(|_| Err(TokenError::Http("the fetch panicked".into()))))
+                .collect()
+        }))
+    }
+}
+
 fn fetch_list(client: &reqwest::blocking::Client, url: &str) -> Result<(String, Vec<Token>), TokenError> {
-    let resp = client.get(url).send().map_err(|e| TokenError::Http(e.to_string()))?;
-    let text = resp.text().map_err(|e| TokenError::Http(e.to_string()))?;
+    let resp = client.get(url).send().map_err(http_error)?;
+    let text = resp.text().map_err(http_error)?;
     parse_list(&text)
+}
+
+/// reqwest's message leaves out why ("error sending request"); its sources say refused,
+/// timed out or reset.
+fn http_error(e: reqwest::Error) -> TokenError {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        msg.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    TokenError::Http(msg)
 }
 
 pub(crate) fn parse_list(text: &str) -> Result<(String, Vec<Token>), TokenError> {
@@ -875,12 +931,17 @@ mod tests {
     }
 
     fn mock_server(body: &'static str) -> String {
+        slow_server(body, std::time::Duration::ZERO)
+    }
+
+    fn slow_server(body: &'static str, delay: std::time::Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 2048];
                 let _ = stream.read(&mut buf);
+                std::thread::sleep(delay);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -914,6 +975,40 @@ mod tests {
             ..offline()
         });
         assert!(matches!(tl.refresh_now(), Err(TokenError::Proxy(_))));
+    }
+
+    #[test]
+    fn a_refresh_whose_lists_moved_while_it_fetched_is_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tl = TokenList::with_dir(dir.path().to_path_buf());
+        tl.configure(ListConfig { list_urls: vec![mock_server(LIST)], timeout_secs: 5, ..offline() });
+        let plan = tl.refresh_plan();
+        let fetched = plan.fetch();
+        tl.configure(ListConfig { list_urls: vec!["http://127.0.0.1:1/other.json".into()], timeout_secs: 5, ..offline() });
+        assert!(matches!(tl.apply_refresh(&plan, fetched), Err(TokenError::Superseded)));
+        assert_eq!((tl.counts().downloaded, tl.get_list_sources().len()), (0, 0));
+        assert!(!dir.path().join("token_cache.json").exists());
+    }
+
+    #[test]
+    fn a_failed_fetch_says_why() {
+        let mut tl = TokenList::new();
+        tl.configure(ListConfig { list_urls: vec!["http://127.0.0.1:1/l.json".into()], timeout_secs: 2, ..offline() });
+        tl.refresh_now().unwrap();
+        let err = tl.get_list_sources()[0].error.clone().unwrap();
+        assert!(err.starts_with("http: error sending request") && err.len() > "http: error sending request for url (http://127.0.0.1:1/l.json)".len(), "{err}");
+    }
+
+    #[test]
+    fn every_list_is_fetched_at_once() {
+        let slow = std::time::Duration::from_millis(800);
+        let urls = vec![slow_server(LIST, slow), slow_server(LIST, slow)];
+        let mut tl = TokenList::new();
+        tl.configure(ListConfig { list_urls: urls, timeout_secs: 5, ..offline() });
+        let started = std::time::Instant::now();
+        tl.refresh_now().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(1400), "took {:?}", started.elapsed());
+        assert!(tl.get_list_sources().iter().all(|s| s.ok));
     }
 
     // ---- the shipped offline list -------------------------------------------
