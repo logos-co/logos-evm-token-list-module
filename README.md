@@ -27,8 +27,9 @@ upgrades one way only, so a user's own settings are never re-defaulted.
 `init_defaults` is idempotent within and across process lifetimes: it declines
 once `list_config.json` exists, and `applied: false` is an answer, not an error.
 
-Callers must gate on `state == "unconfigured"` — this module holds one config
-record, so an unconditional call would be a whole-record write.
+Callers need no `config_status` gate: `init_defaults` makes that check itself,
+inside one serialized call, so asking on every start never re-defaults a list
+someone configured.
 
 ## Catalogue and offered set
 
