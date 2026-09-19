@@ -28,8 +28,8 @@ upgrades one way only, so a user's own settings are never re-defaulted.
 once `list_config.json` exists, and `applied: false` is an answer, not an error.
 
 Callers need no `config_status` gate: `init_defaults` makes that check itself,
-inside one serialized call, so asking on every start never re-defaults a list
-someone configured.
+under the same lock as its write, so asking on every start never re-defaults a
+list someone configured.
 
 ## Catalogue and offered set
 
@@ -57,7 +57,7 @@ Native currencies are intentionally absent: chain metadata belongs to
 | `configure(configJson)` | `{ listUrls?, proxy?, proxyRequired?, refreshSecs?, timeoutSecs?, useEmbeddedList? }` |
 | `config_status()` | no network I/O; cheap on a consumer's startup path |
 | `init_defaults()` | applies the offline defaults where nothing is configured |
-| `refresh_now()` | the only method that fetches; nothing schedules it |
+| `refresh_now()` | the only method that fetches; nothing schedules it. Every list at once, with the store released, so other calls are answered meanwhile; one refresh at a time |
 | `get_tokens(chainId)` | merged catalogue rows, labelled `builtin`/`custom`/`downloaded`/`embedded` |
 | `get_tokens_by_address(chainId, addressesJson)` | narrow query; 94 KB → 449 B for a two-token wallet refresh |
 | `get_all_tokens()` | ~360 KB with the shipped list active |

@@ -25,11 +25,10 @@ its generated transport glue.
 ### Where this repo sits in the EVM wallet
 
 ```
-logos-evm-wallet-ui            (universal C++ ui_qml app — tabs incl. Market)
-        │  drives over the Logos bridge
-        ▼
-logos-evm-wallet-backend-module   (coordinator / tx builder)
-        │  calls token_list_module.get_tokens / get_all_tokens / add_custom_token …
+eth_wallet_backend  (logos-eth-wallet-backend: offered rows for balances, sends, history; picker)
+uniswap_backend     (logos-uniswap-backend: offered rows, token lookups, picker)
+token_list_ui       (logos-token-list-ui: configure, refresh_now, custom tokens)
+        │  call token_list_module.<method>; both backends subscribe to tokens_updated
         ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  THIS REPO — logos-evm-token-list-module (token_list_module)  │
@@ -45,8 +44,8 @@ logos-evm-wallet-backend-module   (coordinator / tx builder)
 It is a **leaf module**: it has **no Logos-module dependencies** of its own
 (`metadata.json → "dependencies": []`). Its only network dependency is the
 **vendored `net-proxy` chokepoint** (`src/proxy.rs`), an inlined copy of the
-canonical `logos-net-proxy` crate. Callers (chiefly `wallet_backend_module`, and
-ultimately `wallet-ui`) drive it; it does not call other modules.
+canonical `logos-net-proxy` crate. Callers (`eth_wallet_backend`, `uniswap_backend`
+and the Token Lists app) drive it; it does not call other modules.
 
 ---
 
@@ -54,7 +53,7 @@ ultimately `wallet-ui`) drive it; it does not call other modules.
 
 ```mermaid
 flowchart TB
-    subgraph caller["Caller (wallet_backend_module / logoscore)"]
+    subgraph caller["Caller (eth_wallet_backend / uniswap_backend / token_list_ui / logoscore)"]
         RPC["invokeRemoteMethod / logoscore call\n(token_list_module.<method>)"]
     end
 
@@ -63,7 +62,7 @@ flowchart TB
     subgraph module["token_list_module (Rust cdylib)"]
         direction TB
         GLUE["glue.rs\nTokenListModule trait impl\n(TokenListModuleImpl)\n+ generated provider_gen.rs\n+ logos_module_install()"]
-        STATE["TokenListModuleImpl\n{ tl: Option&lt;TokenList&gt; }\nlazily built on_context_ready"]
+        STATE["TokenListModuleImpl\n{ tl: RwLock&lt;Option&lt;TokenList&gt;&gt;, refreshing }\nlazily built on_context_ready"]
         CORE["tokens.rs — TokenList core\nconfig · sources · downloaded · custom\n(persisted dir)"]
         PROXY["proxy.rs — net-proxy chokepoint\nbuild_client(ProxyConfig)\nfail-closed"]
         EVT["TokenListModuleEvents\nemit_tokens_updated(chainId)"]
@@ -84,10 +83,10 @@ flowchart TB
 | Layer | File | Responsibility |
 |-------|------|----------------|
 | **Glue / transport** | `rust-lib/src/glue.rs` | Defines the `TokenListModule` IPC trait + `TokenListModuleEvents`; `include!`s the build-time `generated/provider_gen.rs` (provides `RustModuleContext`, `install::<T>()`, `emit_tokens_updated`); marshals JSON in/out; `logos_module_install()` entry point. |
-| **State** | `glue.rs` `TokenListModuleImpl` | Holds `tl: Option<TokenList>`. The `TokenList` is created lazily in `on_context_ready` once the runtime hands over the per-instance persistence path. Before that, methods return a `"context not ready"` error. |
+| **State** | `glue.rs` `TokenListModuleImpl` | Holds `tl: RwLock<Option<TokenList>>` and a `refreshing` mutex. The `TokenList` is created lazily in `on_context_ready` once the runtime hands over the per-instance persistence path. Before that, methods return a `"context not ready"` error. See [Concurrency](#concurrency). |
 | **Core logic** | `rust-lib/src/tokens.rs` | The pure (Logos-free) `TokenList`: configuration, fetch+parse+merge, per-chain dedup, custom list, persistence. Unit-tested with `cargo test --no-default-features`. |
 | **Network chokepoint** | `rust-lib/src/proxy.rs` | Vendored `net-proxy`. `build_client(&ProxyConfig)` is the **only** `reqwest` client constructor in the crate; fails closed when a proxy is required but unusable. |
-| **Events** | `glue.rs` | `tokens_updated(chainId)` emitted per affected chain after a successful refresh or a custom-token change. |
+| **Events** | `glue.rs` | `tokens_updated(chainId)` emitted per chain whose served rows changed, once the store's lock is released. |
 
 **Feature gating.** The core (`tokens` + `proxy`) is plain Rust. The Logos glue
 is behind the default `logos_module` Cargo feature (`Cargo.toml`), which pulls in
@@ -107,7 +106,7 @@ get_tokens` sequence plus the fail-closed branch.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Caller<br/>(wallet_backend / logoscore)
+    participant C as Caller<br/>(token_list_ui / logoscore)
     participant G as glue.rs<br/>TokenListModuleImpl
     participant T as tokens.rs<br/>TokenList
     participant P as proxy.rs<br/>build_client
@@ -122,22 +121,23 @@ sequenceDiagram
     G-->>C: true / false
 
     C->>G: refresh_now()
-    G->>T: refresh_now()
-    T->>P: build_client(ProxyConfig{proxy, proxy_required, timeout_secs})
+    G->>T: refresh_plan() under the read lock (listUrls + ProxyConfig)
+    Note over G,N: the fetch runs with the lock released: other calls are answered meanwhile
+    G->>P: plan.fetch() → build_client(ProxyConfig{proxy, proxy_required, timeout_secs})
     alt proxy required but unset/unusable
-        P-->>T: Err(ProxyRequiredButUnset / ProxyUnusable)
-        T-->>G: Err(TokenError::Proxy)
+        P-->>G: Err(ProxyRequiredButUnset / ProxyUnusable)
         G-->>C: { ok:false, error:"proxy: proxy required but none configured ..." }
     else client built
-        P-->>T: reqwest::blocking::Client
-        loop each list URL
-            T->>N: GET <listUrl>
-            N-->>T: token-list JSON (or HTTP/parse error)
-            Note over T: record ListSource{url,name,token_count,ok,error}
+        P-->>G: reqwest::blocking::Client
+        loop every list URL, all at once
+            G->>N: GET <listUrl>
+            N-->>G: token-list JSON (or HTTP/parse error)
         end
+        G->>T: apply_refresh(plan, fetched) under the write lock
+        Note over T: refused if listUrls or the proxy policy moved meanwhile<br/>record ListSource{url,name,token_count,ok,error}
         T->>D: write token_cache.json (merged downloaded set)
         T-->>G: Ok(tokenCount)
-        G-->>C: emit tokens_updated(chainId) per chain<br/>{ ok:true, tokenCount }
+        G-->>C: emit tokens_updated(chainId) per chain moved<br/>{ ok:true, tokenCount }
     end
 
     C->>G: get_tokens(chainId)
@@ -202,9 +202,15 @@ to `token_cache.json`, and emit `tokens_updated` for every affected chain.
   `ListSource` is recorded with `ok:false` and an `error`, and the remaining URLs
   still contribute. The call only returns an error envelope when the **client
   itself** cannot be built (the fail-closed gate).
-- **Events** after success, `tokens_updated(chainId)` is emitted for each distinct
-  chain across downloaded + custom tokens.
+- **Events** after success, `tokens_updated(chainId)` is emitted for each chain
+  whose served rows changed.
 - **Idempotent** re-running replaces the downloaded set; safe to retry.
+- **Concurrent reads** every list is fetched at once, with the store released:
+  all other calls are answered from the current rows while it waits.
+- **One at a time** a second call while one runs gets
+  `{ "ok": false, "error": "a refresh is already running" }`.
+- **Superseded** if `listUrls` or the proxy policy change while it fetches, the
+  result is discarded: `"the list configuration changed during the fetch; refresh again"`.
 
 ```bash
 logoscore call token_list_module refresh_now
@@ -327,13 +333,11 @@ previous runs. Until this fires, every method reports "context not ready".
 ### Event — `tokens_updated(chain_id: i64)`
 
 Defined by the `TokenListModuleEvents` trait and emitted via the generated
-`emit_tokens_updated`. Fired **per affected chain** after:
+`emit_tokens_updated`. Fired once **per chain whose served rows changed**, after
+any call that changes them: `refresh_now`, `configure` (`useEmbeddedList`),
+`set_token_enabled`, and adding, importing or removing custom tokens.
 
-- a successful `refresh_now` (one event per distinct chain in the merged set), or
-- `add_custom_token` (the token's chain), or
-- `remove_custom_token` (only when a token was actually removed).
-
-Subscribers (e.g. `wallet_backend_module` / `wallet-ui`) use it to re-pull tokens
+Subscribers (`eth_wallet_backend`, `uniswap_backend`) use it to re-read tokens
 for the changed chain.
 
 ### Method summary
@@ -364,8 +368,8 @@ Every field has a default, so the minimal config is `{ "listUrls": [...] }`.
 | `listUrls` | `list_urls` | `Vec<String>` | `[]` | Token-list URLs to fetch and merge. |
 | `proxy` | `proxy` | `Option<String>` | `null` | Proxy URL, e.g. `socks5h://127.0.0.1:9050`. `socks5h` resolves DNS through the proxy (Tor-preferred). Empty/whitespace counts as "no proxy". |
 | `proxyRequired` | `proxy_required` | `bool` | `false` | If `true`, a usable proxy **must** be configured or fetches fail closed. |
-| `refreshSecs` | `refresh_secs` | `u64` | `0` | Advisory refresh interval (seconds). The module does **not** self-schedule; this is read by the wallet backend, which drives `refresh_now` on its own worker. `0` = no periodic refresh. |
-| `timeoutSecs` | `timeout_secs` | `u64` | `30` | Per-request HTTP timeout (seconds). `0` leaves reqwest's default. |
+| `refreshSecs` | `refresh_secs` | `u64` | `0` | Advisory refresh interval (seconds). The module does **not** self-schedule, and nothing reads this today: the Token Lists app calls `refresh_now` when the user presses Refresh. `0` = no periodic refresh. |
+| `timeoutSecs` | `timeout_secs` | `u64` | `8` | Per-request HTTP timeout (seconds), under the 20 s call deadline. Lists are fetched at once, so a refresh takes about this long at most. `0` leaves reqwest's default. A stored config keeps the value it was saved with. |
 
 Example:
 
@@ -378,7 +382,7 @@ Example:
   "proxy": "socks5h://127.0.0.1:9050",
   "proxyRequired": true,
   "refreshSecs": 3600,
-  "timeoutSecs": 30
+  "timeoutSecs": 8
 }
 ```
 
@@ -481,9 +485,9 @@ These behaviours live in `tokens.rs` and are the heart of the module.
 
 1. **Configure.** `listUrls` (and proxy/timeout policy) come from `ListConfig`.
 2. **Refresh.** `refresh_now` builds **one** client via the fail-closed
-   chokepoint, then iterates `listUrls` in order, `GET`-ing each and parsing it.
-   Successful tokens are concatenated into a single `downloaded` vector;
-   per-URL outcomes are recorded as `ListSource`s. The `downloaded` set
+   chokepoint, then `GET`s every `listUrl` at once and parses each. Successful
+   tokens are concatenated, in `listUrls` order, into a single `downloaded`
+   vector; per-URL outcomes are recorded as `ListSource`s. The `downloaded` set
    **replaces** the previous one (not appended) and is cached to disk.
 3. **Per-chain dedup on read.** `get_tokens(chain)` walks **custom first, then
    downloaded**, keeping the first entry seen per **lower-cased address** for that
@@ -533,18 +537,20 @@ not counting custom); the deduped, custom-merged numbers come from `get_tokens` 
 
 ## Concurrency
 
-This module is **single-threaded by design** and is **not** a `concurrency:multi`
-module (`metadata.json` has no `concurrency` field; handlers run serially). The
-design note in `glue.rs` is explicit: periodic refresh is driven *on demand* via
-`refresh_now`, scheduled by the wallet backend on its own worker, specifically so
-that the token store is never shared across threads. `TokenListModuleImpl` takes
-`&mut self` on its methods, and `TokenList` is not `Sync`-shared; serial dispatch
-keeps the persisted JSON files and in-memory vectors consistent without locking.
+`metadata.json` declares `"concurrency": "multi"`: calls run on worker threads and
+the trait's methods take `&self`. The store sits behind an `RwLock`. Readers share
+it, mutators hold it only while they change rows and write the file, and
+`tokens_updated` is emitted once it is released.
 
-Note `refresh_now` performs **blocking** HTTP fetches inside the handler. Under
-load this can momentarily wedge the module's transport (the doc-test wraps
-`refresh_now` in a `reload-module` + re-`configure` retry loop on `RPC_FAILED`);
-because `refresh_now` is idempotent, retrying is safe.
+`refresh_now` holds the lock only to read its plan (`listUrls` and the proxy
+policy) and to apply the result. The downloads run with the lock released, all
+lists at once, so a slow or dead list URL delays that refresh alone: every other
+call is answered from the current rows while it waits. A `refreshing` mutex lets
+one refresh run at a time, and a plan the config has moved past by the time the
+fetch returns is discarded (`TokenError::Superseded`).
+
+`rust-lib/tests/refresh_contract.rs` pins this: the fetch sits outside every
+lock-taking call in `refresh_now`, and `metadata.json` keeps `multi`.
 
 ---
 
@@ -600,6 +606,13 @@ Covers (from `tokens.rs` / `proxy.rs`):
 - `refresh_fetches_and_serves_tokens` — refresh against a local mock HTTP server,
   then read merged tokens + `ListSource`.
 - `refresh_fail_closed_without_proxy` — `proxyRequired` + no proxy → `TokenError::Proxy`.
+- `every_list_is_fetched_at_once` — two lists that each answer in 0.8 s refresh in
+  under 1.4 s.
+- `a_refresh_whose_lists_moved_while_it_fetched_is_discarded` — `apply_refresh`
+  refuses a plan the config has moved past, and writes nothing.
+- `tests/refresh_contract.rs`: the fetch runs outside the store's lock (two mutants
+  rejected), events go out after the lock is released, and `metadata.json` keeps
+  `concurrency: multi`.
 - `proxy.rs`: `fail_closed_when_required_and_unset`, `ok_when_not_required_and_unset`,
   `rejects_unsupported_scheme`.
 
