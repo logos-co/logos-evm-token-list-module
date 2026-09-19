@@ -369,7 +369,7 @@ Every field has a default, so the minimal config is `{ "listUrls": [...] }`.
 | `proxy` | `proxy` | `Option<String>` | `null` | Proxy URL, e.g. `socks5h://127.0.0.1:9050`. `socks5h` resolves DNS through the proxy (Tor-preferred). Empty/whitespace counts as "no proxy". |
 | `proxyRequired` | `proxy_required` | `bool` | `false` | If `true`, a usable proxy **must** be configured or fetches fail closed. |
 | `refreshSecs` | `refresh_secs` | `u64` | `0` | Advisory refresh interval (seconds). The module does **not** self-schedule, and nothing reads this today: the Token Lists app calls `refresh_now` when the user presses Refresh. `0` = no periodic refresh. |
-| `timeoutSecs` | `timeout_secs` | `u64` | `8` | Per-request HTTP timeout (seconds), under the 20 s call deadline. Lists are fetched at once, so a refresh takes about this long at most. `0` leaves reqwest's default. A stored config keeps the value it was saved with. |
+| `timeoutSecs` | `timeout_secs` | `u64` | `30` | Per-request HTTP timeout (seconds). Lists are fetched at once, so a refresh takes about this long at most. `0` leaves reqwest's default. |
 
 Example:
 
@@ -382,7 +382,7 @@ Example:
   "proxy": "socks5h://127.0.0.1:9050",
   "proxyRequired": true,
   "refreshSecs": 3600,
-  "timeoutSecs": 8
+  "timeoutSecs": 30
 }
 ```
 

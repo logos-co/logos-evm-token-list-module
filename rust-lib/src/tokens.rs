@@ -175,8 +175,7 @@ pub struct ListConfig {
 }
 
 fn default_timeout() -> u64 {
-    // Under the 20 s call deadline a caller of refresh_now waits on, as eth_rpc's is.
-    8
+    30
 }
 
 fn default_use_embedded() -> bool {
@@ -184,7 +183,7 @@ fn default_use_embedded() -> bool {
 }
 
 /// Hand-written so `ListConfig::default()` and deserializing `{}` agree; a
-/// derived Default gave `timeoutSecs: 0` where serde gives the default.
+/// derived Default gave `timeoutSecs: 0` where serde gives 30.
 impl Default for ListConfig {
     fn default() -> Self {
         Self {
@@ -1637,7 +1636,7 @@ mod tests {
     fn serde_and_derived_defaults_agree() {
         let from_serde: ListConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(from_serde, ListConfig::default());
-        assert_eq!(from_serde.timeout_secs, 8);
+        assert_eq!(from_serde.timeout_secs, 30);
         assert!(from_serde.use_embedded_list);
     }
 
