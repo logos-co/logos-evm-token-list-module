@@ -813,9 +813,21 @@ impl RefreshPlan {
 }
 
 fn fetch_list(client: &reqwest::blocking::Client, url: &str) -> Result<(String, Vec<Token>), TokenError> {
-    let resp = client.get(url).send().map_err(|e| TokenError::Http(e.to_string()))?;
-    let text = resp.text().map_err(|e| TokenError::Http(e.to_string()))?;
+    let resp = client.get(url).send().map_err(http_error)?;
+    let text = resp.text().map_err(http_error)?;
     parse_list(&text)
+}
+
+/// reqwest's message leaves out why ("error sending request"); its sources say refused,
+/// timed out or reset.
+fn http_error(e: reqwest::Error) -> TokenError {
+    let mut msg = e.to_string();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        msg.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    TokenError::Http(msg)
 }
 
 pub(crate) fn parse_list(text: &str) -> Result<(String, Vec<Token>), TokenError> {
@@ -977,6 +989,15 @@ mod tests {
         assert!(matches!(tl.apply_refresh(&plan, fetched), Err(TokenError::Superseded)));
         assert_eq!((tl.counts().downloaded, tl.get_list_sources().len()), (0, 0));
         assert!(!dir.path().join("token_cache.json").exists());
+    }
+
+    #[test]
+    fn a_failed_fetch_says_why() {
+        let mut tl = TokenList::new();
+        tl.configure(ListConfig { list_urls: vec!["http://127.0.0.1:1/l.json".into()], timeout_secs: 2, ..offline() });
+        tl.refresh_now().unwrap();
+        let err = tl.get_list_sources()[0].error.clone().unwrap();
+        assert!(err.starts_with("http: error sending request") && err.len() > "http: error sending request for url (http://127.0.0.1:1/l.json)".len(), "{err}");
     }
 
     #[test]
