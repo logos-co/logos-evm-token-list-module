@@ -1,4 +1,4 @@
-name: "Running the token-list Module Against logoscore"
+name: "Running the token-list Module Against logosctl"
 output: token-list-module-runtime.md
 release: ""
 
@@ -8,12 +8,12 @@ intro: |
   "custom" list for the Logos multi-chain EVM wallet, deduped per chain. Downloads
   go through the same fail-closed proxy chokepoint as the eth-rpc module.
 
-  This doc-test drives the module through a `logoscore` daemon against a **local
+  This doc-test drives the module through a `logosctl` daemon against a **local
   static file server** (offline, reproducible): it configures a list URL,
   refreshes, reads the merged tokens, enables a token, pages the picker, and
   finally shows the fail-closed refusal when a proxy is required but unavailable.
 
-what_you_build: "This `token_list_module`, packaged as `.lgx`, installed with `lgpm`, and driven through a `logoscore` daemon against a local list server."
+what_you_build: "This `token_list_module`, packaged as `.lgx`, installed into a `logosctl` session, and driven through its daemon against a local list server."
 
 what_you_learn:
   - How list URLs are configured and fetched into the module
@@ -28,15 +28,12 @@ prerequisites:
   - "**A Linux or macOS machine** with `python3` available (used to serve the local token list)."
 
 sections:
-  - title: "Build logoscore and lgpm"
+  - title: "Build logosctl"
     step: true
     steps:
-      - title: "Build logoscore"
-        run: "nix build 'github:logos-co/logos-logoscore-cli#cli' --out-link ./logos"
-        check_file: "logos/bin/logoscore"
-      - title: "Build lgpm"
-        run: "nix build 'github:logos-co/logos-package-manager#cli' -o lgpm"
-        check_file: "lgpm/bin/lgpm"
+      - title: "Build logosctl"
+        run: "nix build 'github:logos-co/logos-logoscore-cli#ctl' --out-link ./logos"
+        check_file: "logos/bin/logosctl"
 
   - title: "Build and install the token-list module"
     step: true
@@ -45,15 +42,26 @@ sections:
         run: "nix build 'github:logos-co/logos-evm-token-list-module{release}#lgx' --no-write-lock-file -o token-list-lgx"
         code_block: |
           nix build 'github:logos-co/logos-evm-token-list-module{release}#lgx' -o token-list-lgx
-      - title: "Seed the capability module"
-        run: |
-          mkdir -p modules
-          cp -RL ./logos/modules/. ./modules/
-        check_file: "modules/capability_module/manifest.json"
-      - title: "Install the .lgx with lgpm"
-        run: "./lgpm/bin/lgpm --modules-dir ./modules --allow-unsigned install --file token-list-lgx/*.lgx"
+      - title: "Start the daemon"
+        text: |
+          The session directory, `./session`, holds the daemon's config, its
+          installed modules and their data. `--detach` returns once the daemon
+          accepts commands.
+        # The bundled package downloader starts a storage node in $HOME; keep it
+        # out of the real one.
+        run: "mkdir -p home && HOME=\"$PWD/home\" ./logos/bin/logosctl --config-dir ./session daemon start --detach"
+        code_block: "logosctl daemon start --detach"
         expect_contains:
-          - "Installed to:"
+          - "Daemon started"
+      - title: "Install the .lgx"
+        text: |
+          A path ending in `.lgx` installs from disk, with no catalog involved. A
+          local build is unsigned, which the session's default policy accepts with
+          a warning. `-y` confirms, since there is no terminal to ask on.
+        run: "./logos/bin/logosctl --config-dir ./session install token-list-lgx/*.lgx -y"
+        code_block: "logosctl install token-list-lgx/*.lgx -y"
+        expect_contains:
+          - '"installed":["token_list_module"]'
 
   - title: "Serve a token list locally"
     step: true
@@ -71,11 +79,11 @@ sections:
               ]
             }
       - title: "Start a static file server"
-        run: "sh -c 'python3 -m http.server 8601 > httpd.log 2>&1 &'"
+        run: "sh -c 'python3 -m http.server 8601 > httpd.log 2>&1 & echo $! > httpd.pid'"
         code_block: "python3 -m http.server 8601 &"
       - run: "sleep 2"
 
-  - title: "Run the daemon and drive the module"
+  - title: "Drive the module"
     step: true
     steps:
       - title: "Write the configs"
@@ -93,80 +101,77 @@ sections:
           path: custom_token.json
           content: |
             { "chainId": 1, "address": "0x1111111111111111111111111111111111111111", "name": "Mine", "symbol": "MINE", "decimals": 18 }
-      - title: "Start the daemon"
-        run: "sh -c './logos/bin/logoscore -D -m ./modules > logs.txt 2>&1 &'"
-        code_block: "logoscore -D -m ./modules > logs.txt &"
-      - run: "sleep 3"
       - title: "Load the module"
-        run: "./logos/bin/logoscore load-module token_list_module"
+        run: "./logos/bin/logosctl --config-dir ./session module load token_list_module"
+        code_block: "logosctl module load token_list_module"
         expect_contains:
           - "token_list_module"
       - title: "Configure the list URL"
-        run: "./logos/bin/logoscore call token_list_module configure @tl_config.json"
-        code_block: "logoscore call token_list_module configure @tl_config.json"
+        run: "./logos/bin/logosctl --config-dir ./session call token_list_module configure @tl_config.json"
+        code_block: "logosctl call token_list_module configure @tl_config.json"
         expect_contains:
           - "true"
       - title: "Refresh (fetch + parse + merge)"
         # Driving the module through a blocking HTTP fetch can wedge its transport
         # on loaded CI runners (RPC_FAILED that persists within the session). On a
-        # transient failure, reset the module with reload-module + re-configure
+        # transient failure, reset the module with `module reload` + re-configure
         # before retrying. refresh_now is idempotent, so this is safe.
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call token_list_module refresh_now 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call token_list_module refresh_now 2>&1)
             case "$out" in
               *RPC_FAILED*)
-                ./logos/bin/logoscore reload-module token_list_module >/dev/null 2>&1 || true
-                ./logos/bin/logoscore call token_list_module configure @tl_config.json >/dev/null 2>&1 || true
+                ./logos/bin/logosctl --config-dir ./session module reload token_list_module >/dev/null 2>&1 || true
+                ./logos/bin/logosctl --config-dir ./session call token_list_module configure @tl_config.json >/dev/null 2>&1 || true
                 sleep 3 ;;
               *) break ;;
             esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call token_list_module refresh_now"
+        code_block: "logosctl call token_list_module refresh_now"
         expect_contains:
           - "tokenCount"
       - title: "Read merged tokens for chain 1"
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call token_list_module get_tokens 1 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call token_list_module get_tokens 1 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
-        code_block: "logoscore call token_list_module get_tokens 1"
+        code_block: "logosctl call token_list_module get_tokens 1"
         expect_contains:
           - "USDC"
           - "USDT"
       - title: "Add a custom token"
-        run: "./logos/bin/logoscore call token_list_module add_custom_token @custom_token.json"
-        code_block: "logoscore call token_list_module add_custom_token @custom_token.json"
+        run: "./logos/bin/logosctl --config-dir ./session call token_list_module add_custom_token @custom_token.json"
+        code_block: "logosctl call token_list_module add_custom_token @custom_token.json"
         expect_contains:
           - "true"
       - title: "The custom token now appears"
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call token_list_module get_tokens 1 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call token_list_module get_tokens 1 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
         expect_contains:
           - "MINE"
       - title: "Enable USDC from the catalogue"
-        run: "./logos/bin/logoscore call token_list_module set_token_enabled 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true"
-        code_block: "logoscore call token_list_module set_token_enabled 1 0xA0b8... true"
+        run: "./logos/bin/logosctl --config-dir ./session call token_list_module set_token_enabled 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 true"
+        code_block: "logosctl call token_list_module set_token_enabled 1 0xA0b8... true"
         expect_contains:
           - '\"enabled\":true'
           - '\"changed\":true'
       - title: "Read the offered ERC-20 set"
-        run: "./logos/bin/logoscore call token_list_module list_offered 1"
-        code_block: "logoscore call token_list_module list_offered 1"
+        run: "./logos/bin/logosctl --config-dir ./session call token_list_module list_offered 1"
+        code_block: "logosctl call token_list_module list_offered 1"
         expect_contains:
           - "WETH"
           - "USDC"
           - '\"builtin\":true'
       - title: "Search the offered-first picker"
-        run: "./logos/bin/logoscore call token_list_module list_available 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 0 10"
-        code_block: "logoscore call token_list_module list_available 1 0xA0b8... 0 10"
+        run: "./logos/bin/logosctl --config-dir ./session call token_list_module list_available 1 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 0 10"
+        code_block: "logosctl call token_list_module list_available 1 0xA0b8... 0 10"
         expect_contains:
           - '\"total\":1'
           - "USDC"
@@ -174,7 +179,7 @@ sections:
       - title: "List the configured sources"
         run: |
           for i in 1 2 3 4 5 6; do
-            out=$(./logos/bin/logoscore call token_list_module get_list_sources 2>&1)
+            out=$(./logos/bin/logosctl --config-dir ./session call token_list_module get_list_sources 2>&1)
             case "$out" in *RPC_FAILED*) sleep 3 ;; *) break ;; esac
           done
           printf '%s\n' "$out"
@@ -182,21 +187,20 @@ sections:
           - "Test List"
       - title: "Fail-closed: refuse a fetch when a proxy is required"
         run: |
-          ./logos/bin/logoscore call token_list_module configure @tl_config_fc.json
-          ./logos/bin/logoscore call token_list_module refresh_now
+          ./logos/bin/logosctl --config-dir ./session call token_list_module configure @tl_config_fc.json
+          ./logos/bin/logosctl --config-dir ./session call token_list_module refresh_now
         code_block: |
-          logoscore call token_list_module configure @tl_config_fc.json
-          logoscore call token_list_module refresh_now
+          logosctl call token_list_module configure @tl_config_fc.json
+          logosctl call token_list_module refresh_now
         expect_contains:
           - "proxy required"
       - title: "Stop the daemon and the file server"
         run: |
-          trap '' TERM
-          ./logos/bin/logoscore stop || true
-          pkill -f "http.server 8601" 2>/dev/null || true
-          true
-      - run: "sleep 2"
+          ./logos/bin/logosctl --config-dir ./session daemon stop || true
+          kill "$(cat httpd.pid)" 2>/dev/null || true
+        code_block: "logosctl daemon stop"
       - title: "Confirm the daemon has stopped"
-        run: "./logos/bin/logoscore status || true"
+        run: "./logos/bin/logosctl --config-dir ./session daemon status || true"
+        code_block: "logosctl daemon status"
         expect_contains:
           - '"status":"not_running"'
